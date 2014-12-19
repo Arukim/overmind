@@ -1,9 +1,9 @@
 package main
 
 import (
-	"encoding/json"
-	"encoding/gob"
 	"container/list"
+	"encoding/gob"
+	"encoding/json"
 	"flag"
 	"fmt"
 	"net"
@@ -12,21 +12,23 @@ import (
 
 // DTO, command type
 const (
-	VAL_REQ = 1 + iota  // Request about value presence in cache
-	VAL_RESP // Response with info about value
+	VAL_REQ  = 1 + iota // Request about value presence in cache
+	VAL_RESP            // Response with info about value
 )
 
 // DTO, mixed for req/resp in UDP
 type ComPacket struct {
-	Type int // Command type
-	Id int // Command Id
-	Key string // Requested key
-	Port string // Response point
+	Type     int    // Command type
+	Id       int    // Command Id
+	Key      string // Requested key
+	Port     string // Response point
+	HasValue bool
 }
 
 // DTO, TCP request for data
 type DataReqPacket struct {
-	Key string
+	Key      string
+	ReadFlag bool
 }
 
 // DTO, TCP response with requested data
@@ -35,17 +37,19 @@ type DataRespPacket struct {
 }
 
 // Information about request for data
-type Request struct { 
-	Id int
-	Key string
+type Request struct {
+	Id       int
+	Key      string
 	Callback chan DataOwnerInfo
-	Cancel chan int
+	Cancel   chan int
 }
 
 //Information about node, which owns requested data
-type DataOwnerInfo struct { 
-	Id int
-	Addr string
+type DataOwnerInfo struct {
+	Id           int
+	Addr         string
+	HasValue     bool
+	ItemsInCache int
 }
 
 // read data from database
@@ -53,41 +57,57 @@ func readFromDb(key string) string {
 	return "Db entry for key " + key
 }
 
+// Request to cache
+type CacheRequest struct {
+	Key        string
+	ReadFromDb bool
+}
+
 // Here is cache (hashmap)
-func createCacheNode() (chan string, <-chan string) {
+func createCacheNode() (chan CacheRequest, <-chan string) {
 	fmt.Println("Cache node started")
-	cacheReq := make(chan string)
+	cacheReq := make(chan CacheRequest)
 	cacheResp := make(chan string)
+	cache := make(map[string]string)
 	go func() {
 		for {
-			cache := make(map[string]string)
-			key := <-cacheReq
-			res, ok := cache[key]
-			if !ok {
-				res = readFromDb(key)
-				cache[key] = key
+			req := <-cacheReq
+			fmt.Println("request received")
+			if req.ReadFromDb {
+				fmt.Println("read key from db")
+				cache[req.Key] = readFromDb(req.Key)
 			}
-			cacheResp <- res
+			res, ok := cache[req.Key]
+			if !ok {
+				cacheResp <- ""
+			} else {
+				fmt.Println("returning key")
+				cacheResp <- res
+			}
 		}
 	}()
 	return cacheReq, cacheResp
 }
 
 // If client is connected for data, try to get it from cache and return to the client
-func handleDataConnection(conn net.Conn, cacheReq chan string, cacheResp <- chan string){
+func handleDataConnection(conn net.Conn, cacheReqCh chan CacheRequest, cacheResp <-chan string) {
 	defer conn.Close()
 	dec := gob.NewDecoder(conn)
 	req := DataReqPacket{}
 	dec.Decode(&req)
-	cacheReq <- req.Key
-	resp := DataRespPacket {Value: <- cacheResp}
+
+	cacheReq := CacheRequest{Key: req.Key, ReadFromDb: req.ReadFlag}
+	fmt.Println("hDataConnection: Requesting db")
+	cacheReqCh <- cacheReq
+	resp := DataRespPacket{Value: <-cacheResp}
+	fmt.Println("hDataConnection: sending response")
 	enc := gob.NewEncoder(conn)
-	enc.Encode(resp)	
+	enc.Encode(resp)
 }
 
-// Data server is simply handling incoming data connections 
-func runDataServer(port string, cacheReq chan string, cacheResp <- chan string){
-	sock, _ := net.Listen("tcp",port)
+// Data server is simply handling incoming data connections
+func runDataServer(port string, cacheReq chan CacheRequest, cacheResp <-chan string) {
+	sock, _ := net.Listen("tcp", port)
 	for {
 		conn, err := sock.Accept()
 		if err != nil {
@@ -102,38 +122,49 @@ func runDataServer(port string, cacheReq chan string, cacheResp <- chan string){
 // If ValueRequest packet is received - local cache is checked for this value
 // and if it's present ValueResponse packet is returned
 // For ValueResponse packet - signal is sent to TaskQueue using quequeRun chan
-func runCommHandler(in <-chan ComPacket, port string, cacheReq chan string,
-	cacheResp <- chan string, queueRun chan DataOwnerInfo){
+func runCommHandler(in <-chan ComPacket, port string, cacheReqCh chan CacheRequest,
+	cacheResp <-chan string, queueRun chan DataOwnerInfo) {
 	for {
 		packet := <-in
-		switch(packet.Type){
+		switch packet.Type {
 		case VAL_REQ:
-			cacheReq <- packet.Key
-			<- cacheResp
-			var resp ComPacket
-			resp.Type = VAL_RESP
-			resp.Port = port
-			resp.Id = packet.Id
 			conn, err := net.Dial("udp", packet.Port)
 			if err != nil {
-				fmt.Printf("Couldn't connect to %s\n",packet.Port)
+				fmt.Printf("Couldn't connect to %s\n", packet.Port)
 				fmt.Println(err)
 				return
 			}
 			defer conn.Close()
+
+			cacheReq := CacheRequest{Key: packet.Key, ReadFromDb: false}
+			cacheReqCh <- cacheReq
+			val := <-cacheResp
+			var resp ComPacket
+			if val != "" {
+				resp.HasValue = true
+			} else {
+				resp.HasValue = false
+			}
+			resp.Type = VAL_RESP
+			resp.Port = port
+			resp.Id = packet.Id
+
 			enc := json.NewEncoder(conn)
 			enc.Encode(resp)
 		case VAL_RESP:
 			fmt.Printf("response is %v\n", packet)
-			owner := DataOwnerInfo{ Id: packet.Id, Addr: packet.Port}
+			owner := DataOwnerInfo{Id: packet.Id,
+				Addr:     packet.Port,
+				HasValue: packet.HasValue}
 			queueRun <- owner
+
 		}
 	}
 }
 
 // Host Command server (UDP)
-func runCommandServer(port string, cacheReq chan string, cacheResp <- chan string,
-queueRun chan DataOwnerInfo) {
+func runCommandServer(port string, cacheReq chan CacheRequest, cacheResp <-chan string,
+	queueRun chan DataOwnerInfo) {
 	handlerCh := make(chan ComPacket)
 	go runCommHandler(handlerCh, port, cacheReq, cacheResp, queueRun)
 	addr, _ := net.ResolveUDPAddr("udp", port)
@@ -147,28 +178,55 @@ queueRun chan DataOwnerInfo) {
 	}
 }
 
-// Wait until data is found on network or cancel task
-func waitForValue(req Request){
-	select{
-	case owner := <- req.Callback: // data owner found
-		// connect via tcp
-		conn, err := net.Dial("tcp", owner.Addr)
-		if err != nil {
-			fmt.Println("cannot conect to data owner")
-		}
-		defer conn.Close()
-		// send data request
-		encoder := gob.NewEncoder(conn)
-		req := DataReqPacket{Key: req.Key}
-		encoder.Encode(req)
+func downloadData(request Request, owner DataOwnerInfo, readFlag bool) {
+	request.Cancel <- request.Id
+	// connect via tcp
+	conn, err := net.Dial("tcp", owner.Addr)
+	if err != nil {
+		fmt.Println("cannot conect to data owner")
+	}
+	defer conn.Close()
+	// send data request
+	encoder := gob.NewEncoder(conn)
+	req := DataReqPacket{Key: request.Key, ReadFlag: readFlag}
+	encoder.Encode(req)
 
-		// receive data
-		decoder := gob.NewDecoder(conn)
-		resp := DataRespPacket{}
-		decoder.Decode(&resp)
-		fmt.Printf("data received %s\n", resp.Value)		
-	case <- time.After(time.Millisecond * 30):// timeout
-		req.Cancel <- req.Id
+	// receive data
+	decoder := gob.NewDecoder(conn)
+	resp := DataRespPacket{}
+	decoder.Decode(&resp)
+	fmt.Printf("data received %s\n", resp.Value)
+}
+
+// Wait until data is found in cache or request data from db
+func waitForValue(req Request) {
+	var locOwner *DataOwnerInfo // less occupied owner
+	for {
+		select {
+		case owner := <-req.Callback: // data owner found
+			if owner.HasValue {
+				go downloadData(req, owner, false)
+				return
+			} else {
+				// find less occupied owner
+				if locOwner == nil {
+					locOwner = &owner
+				} else {
+					if locOwner.ItemsInCache > owner.ItemsInCache {
+						locOwner = &owner
+					}
+				}
+			}
+		case <-time.After(time.Millisecond * 30): // timeout
+			fmt.Println("timeout!")
+			if locOwner == nil {
+				req.Cancel <- req.Id
+				return
+			}
+			// no one has value, so ask less occupied one to get it from db
+			go downloadData(req, *locOwner, true)
+			return
+		}
 	}
 }
 
@@ -177,29 +235,28 @@ func waitForValue(req Request){
 // queueAdd chan Request - add new Request to Queue
 // queueRun chan DataOwnerInfo - Signals that data owner is found
 // queueRemove - removes item from queue (error or timeout)
-func createRequestQueue()(chan Request, chan DataOwnerInfo, chan int){
+func createRequestQueue() (chan Request, chan DataOwnerInfo, chan int) {
 	queueAdd := make(chan Request)
 	queueRun := make(chan DataOwnerInfo)
 	queueRemove := make(chan int)
-	
-	go func(){
+
+	go func() {
 		tasks := list.New()
 		for {
-			select{
+			select {
 			case req := <-queueAdd: // Add
-//				fmt.Printf("Addind %v to queue\n",req)
+				//fmt.Printf("Addind %v to queue\n",req)
 				tasks.PushBack(req)
-				
+
 			case owner := <-queueRun: //Start download process, remove request from queue
-//				fmt.Printf("Running %v owner\n", owner)
-				for e := tasks.Front(); e !=nil; e = e.Next(){
+				//fmt.Printf("Running %v owner\n", owner)
+				for e := tasks.Front(); e != nil; e = e.Next() {
 					if e.Value.(Request).Id == owner.Id {
 						e.Value.(Request).Callback <- owner
-						tasks.Remove(e)
 					}
 				}
-			case id := <- queueRemove: //Remove item from queue
-				for e := tasks.Front(); e != nil; e = e.Next(){
+			case id := <-queueRemove: //Remove item from queue
+				for e := tasks.Front(); e != nil; e = e.Next() {
 					if e.Value.(Request).Id == id {
 						tasks.Remove(e)
 					}
@@ -211,10 +268,11 @@ func createRequestQueue()(chan Request, chan DataOwnerInfo, chan int){
 }
 
 var currId int
+
 func getValue(key, hostPort string, quequeAdd chan Request, cancel chan int) {
 	currId++
 	var callback = make(chan DataOwnerInfo)
-	req := Request { Id: currId, Key: key, Callback: callback, Cancel: cancel}
+	req := Request{Id: currId, Key: key, Callback: callback, Cancel: cancel}
 	go waitForValue(req)
 	quequeAdd <- req
 	// broadcast all instances
@@ -230,7 +288,7 @@ func getValue(key, hostPort string, quequeAdd chan Request, cancel chan int) {
 
 			// send request packet
 			enc := json.NewEncoder(conn)
-			packet := ComPacket{Type: VAL_REQ, Key: key, Port: hostPort, Id : currId}
+			packet := ComPacket{Type: VAL_REQ, Key: key, Port: hostPort, Id: currId}
 			enc.Encode(packet)
 		}(port)
 	}
@@ -249,7 +307,7 @@ func main() {
 
 	flag.Parse()
 	port := ports[*instanceId]
- 
+
 	// init all
 	cacheReq, cacheResp := createCacheNode()
 	queueAdd, queueRun, queueRemove := createRequestQueue()
