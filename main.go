@@ -42,6 +42,7 @@ type Request struct {
 	Key      string
 	Callback chan DataOwnerInfo
 	Cancel   chan int
+	Exit     chan bool
 }
 
 //Information about node, which owns requested data
@@ -179,7 +180,6 @@ func runCommandServer(port string, cacheReq chan CacheRequest, cacheResp <-chan 
 }
 
 func downloadData(request Request, owner DataOwnerInfo, readFlag bool) {
-	request.Cancel <- request.Id
 	// connect via tcp
 	conn, err := net.Dial("tcp", owner.Addr)
 	if err != nil {
@@ -201,12 +201,14 @@ func downloadData(request Request, owner DataOwnerInfo, readFlag bool) {
 // Wait until data is found in cache or request data from db
 func waitForValue(req Request) {
 	var locOwner *DataOwnerInfo // less occupied owner
+PACKET_LOOP:
 	for {
 		select {
 		case owner := <-req.Callback: // data owner found
 			if owner.HasValue {
+				req.Cancel <- req.Id
 				go downloadData(req, owner, false)
-				return
+				break PACKET_LOOP
 			} else {
 				// find less occupied owner
 				if locOwner == nil {
@@ -219,12 +221,20 @@ func waitForValue(req Request) {
 			}
 		case <-time.After(time.Millisecond * 30): // timeout
 			fmt.Println("timeout!")
-			if locOwner == nil {
-				req.Cancel <- req.Id
-				return
+
+			req.Cancel <- req.Id
+			if locOwner != nil {
+				// no one has value, so ask less occupied one to get it from db
+				go downloadData(req, *locOwner, true)
 			}
-			// no one has value, so ask less occupied one to get it from db
-			go downloadData(req, *locOwner, true)
+			break PACKET_LOOP
+		}
+	}
+	// deadlock protection
+	for {
+		select {
+		case <-req.Callback:
+		case <-req.Exit:
 			return
 		}
 	}
@@ -258,6 +268,7 @@ func createRequestQueue() (chan Request, chan DataOwnerInfo, chan int) {
 			case id := <-queueRemove: //Remove item from queue
 				for e := tasks.Front(); e != nil; e = e.Next() {
 					if e.Value.(Request).Id == id {
+						e.Value.(Request).Exit <- true
 						tasks.Remove(e)
 					}
 				}
@@ -272,7 +283,8 @@ var currId int
 func getValue(key, hostPort string, quequeAdd chan Request, cancel chan int) {
 	currId++
 	var callback = make(chan DataOwnerInfo)
-	req := Request{Id: currId, Key: key, Callback: callback, Cancel: cancel}
+	var exit = make(chan bool)
+	req := Request{Id: currId, Key: key, Callback: callback, Cancel: cancel, Exit: exit}
 	go waitForValue(req)
 	quequeAdd <- req
 	// broadcast all instances
