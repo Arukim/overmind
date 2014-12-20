@@ -16,6 +16,7 @@ type Request struct {
 	Key      string
 	Callback chan DataOwnerInfo
 	Exit     chan bool
+	TimeLimit time.Time
 }
 
 //Information about node, which owns requested data
@@ -161,19 +162,22 @@ var _queueRemove chan int
 var _queueRun chan DataOwnerInfo
 var _hostPort string
 
-func Get(key string, result *string){
+func Get(key string, result *string, executionLimit, expire time.Duration){
 	_currId++
 	var callback = make(chan DataOwnerInfo)
 	var exit = make(chan bool)
+	timeLimit := time.Now().Add(-expire)
 	req := Request{
 		Id: _currId,
 		Key: key,
-		Callback: callback, Exit: exit,
+		Callback: callback,
+		Exit: exit,
+		TimeLimit: timeLimit,
 	}
 	go waitForValue(req)
 	_queueAdd <- req
 	// broadcast all instances
-	packet := dto.DiscoverRequest{Key: key, Addr: _hostPort, Id: _currId}
+	packet := dto.DiscoverRequest{Key: key, Addr: _hostPort, Id: _currId, TimeLimit: timeLimit}
 	for _, port := range ports {
 		go func(port string) {
 			conn, err := net.Dial("udp", port)

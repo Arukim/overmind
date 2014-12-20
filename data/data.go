@@ -1,12 +1,16 @@
 package data
 
+import(
+	"time"
+)
 
 
 // DTO, mixed for req/resp in UDP
 type DiscoverRequest struct {
 	Id       int    // Command Id
 	Key      string // Requested key
-	Addr     string // Response point}
+	Addr     string // Response point
+	TimeLimit time.Time
 }
 
 type DiscoverResponse struct {
@@ -19,6 +23,7 @@ type DiscoverResponse struct {
 type DataReqPacket struct {
 	Key      string
 	ReadFlag bool
+	TimeLimit time.Time
 }
 
 // DTO, TCP response with requested data

@@ -6,6 +6,7 @@ import (
 	"flag"
 	"fmt"
 	dto "github.com/arukim/overmind/data"
+	"time"
 	"net"
 )
 
@@ -13,6 +14,12 @@ import (
 type CacheRequest struct {
 	Key        string
 	ReadFromDb bool
+	TimeLimit time.Time
+}
+
+type CacheEntry struct {
+	CreationTime time.Time
+	Value string
 }
 
 // read data from database
@@ -25,22 +32,33 @@ func createCacheNode() (chan CacheRequest, <-chan string) {
 	fmt.Println("Cache node started")
 	cacheReq := make(chan CacheRequest)
 	cacheResp := make(chan string)
-	cache := make(map[string]string)
+	cache := make(map[string]CacheEntry)
 	go func() {
 		for {
 			req := <-cacheReq
 			fmt.Println("request received")
 			if req.ReadFromDb {
 				fmt.Println("read key from db")
-				cache[req.Key] = readFromDb(req.Key)
+				entry := CacheEntry{}
+				entry.CreationTime = time.Now()
+				entry.Value = readFromDb(req.Key)
+				cache[req.Key] = entry
 			}
 			res, ok := cache[req.Key]
 			if !ok {
 				cacheResp <- ""
-			} else {
-				fmt.Println("returning key")
-				cacheResp <- res
+				continue
 			}
+
+			if res.CreationTime.Sub(req.TimeLimit) < 0 {
+				cacheResp <- ""
+				delete(cache, req.Key)
+				continue
+			}
+
+			fmt.Println("returning key")
+			cacheResp <- res.Value
+
 		}
 	}()
 	return cacheReq, cacheResp
@@ -53,7 +71,7 @@ func handleDataConnection(conn net.Conn, cacheReqCh chan CacheRequest, cacheResp
 	req := dto.DataReqPacket{}
 	dec.Decode(&req)
 
-	cacheReq := CacheRequest{Key: req.Key, ReadFromDb: req.ReadFlag}
+	cacheReq := CacheRequest{Key: req.Key, ReadFromDb: req.ReadFlag, TimeLimit: req.TimeLimit}
 	fmt.Println("hDataConnection: Requesting db")
 	cacheReqCh <- cacheReq
 	resp := dto.DataRespPacket{Value: <-cacheResp}
@@ -89,7 +107,7 @@ func runComHandler(packet *dto.DiscoverRequest, port string, cacheReqCh chan Cac
 	}
 	defer conn.Close()
 	
-	cacheReq := CacheRequest{Key: packet.Key, ReadFromDb: false}
+	cacheReq := CacheRequest{Key: packet.Key, ReadFromDb: false, TimeLimit: packet.TimeLimit}
 	cacheReqCh <- cacheReq
 	val := <-cacheResp
 	var resp dto.DiscoverResponse
