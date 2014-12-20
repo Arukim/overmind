@@ -3,9 +3,9 @@ package main
 import (
 	"encoding/gob"
 	"encoding/json"
-	dto "github.com/arukim/overmind/data"
 	"flag"
 	"fmt"
+	dto "github.com/arukim/overmind/data"
 	"net"
 )
 
@@ -66,7 +66,7 @@ func handleDataConnection(conn net.Conn, cacheReqCh chan CacheRequest, cacheResp
 func runDataServer(port string, cacheReq chan CacheRequest, cacheResp <-chan string) {
 	sock, _ := net.Listen("tcp", port)
 	for {
-		fmt.Printf("data server is listening on tcp%s\n",port)
+		fmt.Printf("data server is listening on tcp%s\n", port)
 		conn, err := sock.Accept()
 		if err != nil {
 			continue
@@ -79,42 +79,34 @@ func runDataServer(port string, cacheReq chan CacheRequest, cacheResp <-chan str
 // If ValueRequest packet is received - local cache is checked for this value
 // and if it's present ValueResponse packet is returned
 // For ValueResponse packet - signal is sent to TaskQueue using quequeRun chan
-func runComHandler(in <-chan dto.DiscoverRequest, port string, cacheReqCh chan CacheRequest,
-	cacheResp <-chan string) {
-	for {
-		packet := <-in
-		go func(dto.DiscoverRequest){
-			conn, err := net.Dial("udp", packet.Addr)
-			if err != nil {
-				fmt.Printf("Couldn't connect to %s\n", packet.Addr)
-				fmt.Println(err)
-				return
-			}
-			defer conn.Close()
-			
-			cacheReq := CacheRequest{Key: packet.Key, ReadFromDb: false}
-			cacheReqCh <- cacheReq
-			val := <-cacheResp
-			var resp dto.DiscoverResponse
-			if val != "" {
-				resp.HasValue = true
-			} else {
-				resp.HasValue = false
-			}
-			resp.Addr = port
-			resp.Id = packet.Id
-			
-			enc := json.NewEncoder(conn)
-			enc.Encode(resp)
-
-		}(packet)	
+func runComHandler(packet *dto.DiscoverRequest, port string, cacheReqCh chan CacheRequest,
+	cacheResp <- chan string){
+	conn, err := net.Dial("udp", packet.Addr)
+	if err != nil {
+		fmt.Printf("Couldn't connect to %s\n", packet.Addr)
+		fmt.Println(err)
+		return
 	}
+	defer conn.Close()
+	
+	cacheReq := CacheRequest{Key: packet.Key, ReadFromDb: false}
+	cacheReqCh <- cacheReq
+	val := <-cacheResp
+	var resp dto.DiscoverResponse
+	if val != "" {
+		resp.HasValue = true
+	} else {
+		resp.HasValue = false
+	}
+	resp.Addr = port
+	resp.Id = packet.Id
+	
+	enc := json.NewEncoder(conn)
+	enc.Encode(resp)
 }
 
 // Host Command server (UDP)
 func runCommandServer(port string, cacheReq chan CacheRequest, cacheResp <-chan string) {
-	handlerCh := make(chan dto.DiscoverRequest)
-	go runComHandler(handlerCh, port, cacheReq, cacheResp)
 	addr, _ := net.ResolveUDPAddr("udp", port)
 	sock, _ := net.ListenUDP("udp", addr)
 	fmt.Printf("command server is listening on udp%s\n", port)
@@ -122,15 +114,14 @@ func runCommandServer(port string, cacheReq chan CacheRequest, cacheResp <-chan 
 	for {
 		req := dto.DiscoverRequest{}
 		dec.Decode(&req)
-		handlerCh <- req
+		go runComHandler(&req, port, cacheReq, cacheResp)
 	}
 }
 
-
 func main() {
 	// parse CL
-	instanceTcpPort := flag.String("tcp",":8000", "tcp port")
-	instanceUdpPort := flag.String("udp",":8000", "udp port")
+	instanceTcpPort := flag.String("tcp", ":8000", "tcp port")
+	instanceUdpPort := flag.String("udp", ":8000", "udp port")
 
 	flag.Parse()
 

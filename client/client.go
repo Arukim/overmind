@@ -26,21 +26,16 @@ type DataOwnerInfo struct {
 	ItemsInCache int
 }
 
-func runComHandler(in <- chan dto.DiscoverResponse, queueRun chan DataOwnerInfo){
-	for {
-		packet := <- in
-		fmt.Printf("response is %v\n", packet)
-		owner := DataOwnerInfo{Id: packet.Id,
-			Addr:     packet.Addr,
-			HasValue: packet.HasValue}
-		queueRun <- owner
-	}
+func runComHandler(packet *dto.DiscoverResponse, queueRun chan DataOwnerInfo){
+	fmt.Printf("response is %v\n", packet)
+	owner := DataOwnerInfo{Id: packet.Id,
+		Addr:     packet.Addr,
+		HasValue: packet.HasValue}
+	queueRun <- owner
 }
 
 // Host Command server (UDP)
 func runCommandServer(port string, queueRun chan DataOwnerInfo) {
-	handlerCh := make(chan dto.DiscoverResponse)
-	go runComHandler(handlerCh, queueRun)
 	addr, _ := net.ResolveUDPAddr("udp", port)
 	sock, _ := net.ListenUDP("udp", addr)
 	fmt.Printf("network server started at udp%s\n", port)
@@ -48,7 +43,7 @@ func runCommandServer(port string, queueRun chan DataOwnerInfo) {
 	for {
 		req := dto.DiscoverResponse{}
 		dec.Decode(&req)
-		handlerCh <- req
+		go runComHandler(&req, queueRun)
 	}
 }
 
