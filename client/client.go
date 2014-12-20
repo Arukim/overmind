@@ -196,7 +196,7 @@ func Get(key string, result *string, executionLimit, expire time.Duration){
 }
 
 func init(){
-	_hostPort = "localhost:8001"
+	_hostPort = "localhost:8666"
 	_queueAdd, _queueRun, _queueRemove = createRequestQueue();
 	go runCommandServer(_hostPort, _queueRun)
 }
