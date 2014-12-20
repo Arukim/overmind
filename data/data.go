@@ -28,6 +28,6 @@ type DataReqPacket struct {
 
 // DTO, TCP response with requested data
 type DataRespPacket struct {
-	Value string // Data
+	Value interface{} // Data
 }
 

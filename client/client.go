@@ -8,6 +8,7 @@ import (
 	"net"
 	"time"
 	"container/list"
+	"errors"
 )
 
 // Information about request for data
@@ -15,8 +16,8 @@ type Request struct {
 	Id       int
 	Key      string
 	Callback chan DataOwnerInfo
-	Exit     chan bool
 	TimeLimit time.Time
+	Return   chan interface{}
 }
 
 //Information about node, which owns requested data
@@ -64,6 +65,7 @@ func downloadData(request Request, owner DataOwnerInfo, readFlag bool) {
 	decoder := gob.NewDecoder(conn)
 	resp := dto.DataRespPacket{}
 	decoder.Decode(&resp)
+	request.Return <- resp.Value
 	fmt.Printf("data received %s\n", resp.Value)
 }
 
@@ -71,14 +73,13 @@ func downloadData(request Request, owner DataOwnerInfo, readFlag bool) {
 // Wait until data is found in cache or request data from db
 func waitForValue(req Request) {
 	var locOwner *DataOwnerInfo // less occupied owner
-PACKET_LOOP:
 	for {
 		select {
 		case owner := <-req.Callback: // data owner found
 			if owner.HasValue {
 				_queueRemove <- req.Id
 				go downloadData(req, owner, false)
-				break PACKET_LOOP
+				return
 			} else {
 				// find less occupied owner
 				if locOwner == nil {
@@ -97,14 +98,6 @@ PACKET_LOOP:
 				// no one has value, so ask less occupied one to get it from db
 				go downloadData(req, *locOwner, true)
 			}
-			break PACKET_LOOP
-		}
-	}
-	// deadlock protection
-	for {
-		select {
-		case <-req.Callback:
-		case <-req.Exit:
 			return
 		}
 	}
@@ -116,7 +109,7 @@ PACKET_LOOP:
 // queueRun chan DataOwnerInfo - Signals that data owner is found
 // queueRemove - removes item from queue (error or timeout)
 func createRequestQueue() (chan Request, chan DataOwnerInfo, chan int) {
-	queueAdd := make(chan Request)
+	queueAdd := make(chan Request, len(ports))
 	queueRun := make(chan DataOwnerInfo)
 	queueRemove := make(chan int)
 
@@ -138,7 +131,6 @@ func createRequestQueue() (chan Request, chan DataOwnerInfo, chan int) {
 			case id := <-queueRemove: //Remove item from queue
 				for e := tasks.Front(); e != nil; e = e.Next() {
 					if e.Value.(Request).Id == id {
-						e.Value.(Request).Exit <- true
 						tasks.Remove(e)
 					}
 				}
@@ -162,17 +154,17 @@ var _queueRemove chan int
 var _queueRun chan DataOwnerInfo
 var _hostPort string
 
-func Get(key string, result *string, executionLimit, expire time.Duration){
+func Get(key string, result *interface{}, executionLimit, expire time.Duration, getter func())(error){
 	_currId++
-	var callback = make(chan DataOwnerInfo)
-	var exit = make(chan bool)
+	callback := make(chan DataOwnerInfo)
+	resultCh := make(chan interface{}, 1)
 	timeLimit := time.Now().Add(-expire)
 	req := Request{
 		Id: _currId,
 		Key: key,
 		Callback: callback,
-		Exit: exit,
 		TimeLimit: timeLimit,
+		Return: resultCh,
 	}
 	go waitForValue(req)
 	_queueAdd <- req
@@ -192,6 +184,14 @@ func Get(key string, result *string, executionLimit, expire time.Duration){
 			enc := json.NewEncoder(conn)
 			enc.Encode(packet)
 		}(port)
+	}
+
+	select{
+	case *result = <- resultCh:
+		getter()
+		return nil
+	case <-time.After(executionLimit): // timeout
+		return errors.New("Execution limit reached")
 	}
 }
 
