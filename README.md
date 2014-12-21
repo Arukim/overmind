@@ -1,6 +1,10 @@
 Overmind
 ========
 
+# About
+
+Distributed cache written in Golang.
+
 # Requiremens
 
 * MySql is used as DB, install it or change main.go->readFromDb func for your own db
