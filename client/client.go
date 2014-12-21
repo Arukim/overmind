@@ -1,23 +1,26 @@
 package client
 
 import (
+	"container/list"
 	"encoding/gob"
 	"encoding/json"
-	dto "github.com/arukim/overmind/data"
-	"fmt"
-	"net"
-	"time"
-	"container/list"
 	"errors"
+	"fmt"
+	dto "github.com/arukim/overmind/data"
+	"net"
+	"os"
+	"time"
 )
 
-// Information about request for data
+// Information about request (Task)
 type Request struct {
-	Id       int
-	Key      string
-	Callback chan DataOwnerInfo
+	Id        int
+	Key       string
 	TimeLimit time.Time
-	Return   chan interface{}
+	Return    chan interface{}
+	LocOwner  *DataOwnerInfo
+	Start     time.Time
+	NodeCount int
 }
 
 //Information about node, which owns requested data
@@ -28,149 +31,129 @@ type DataOwnerInfo struct {
 	ItemsInCache int
 }
 
-func runComHandler(packet *dto.DiscoverResponse, queueRun chan DataOwnerInfo){
-	fmt.Printf("response is %v\n", packet)
-	owner := DataOwnerInfo{Id: packet.Id,
-		Addr:     packet.Addr,
-		HasValue: packet.HasValue}
-	queueRun <- owner
-}
-
 // Host Command server (UDP)
-func runCommandServer(port string, queueRun chan DataOwnerInfo) {
-	addr, _ := net.ResolveUDPAddr("udp", port)
+func runCommandServer(queueRun chan DataOwnerInfo) {
+	addr, _ := net.ResolveUDPAddr("udp", _conf.HostAddr)
 	sock, _ := net.ListenUDP("udp", addr)
-	fmt.Printf("network server started at udp%s\n", port)
+
+	fmt.Printf("network server started at udp %s\n", _conf.HostAddr)
 	dec := json.NewDecoder(sock)
 	for {
 		req := dto.DiscoverResponse{}
 		dec.Decode(&req)
-		go runComHandler(&req, queueRun)
+		owner := DataOwnerInfo{
+			Id:           req.Id,
+			Addr:         req.Addr,
+			HasValue:     req.HasValue,
+			ItemsInCache: req.Elements}
+		queueRun <- owner
 	}
 }
 
-func downloadData(request Request, owner DataOwnerInfo, readFlag bool) {
+// Connect to client and download data
+func downloadData(request Request, readFlag bool) {
 	// connect via tcp
-	conn, err := net.Dial("tcp", owner.Addr)
+	conn, err := net.Dial("tcp", request.LocOwner.Addr)
 	if err != nil {
-		fmt.Println("cannot conect to data owner")
+		fmt.Printf("cannot conect to data owner %v", request.LocOwner.Addr)
 	}
 	defer conn.Close()
 	// send data request
 	encoder := gob.NewEncoder(conn)
 	req := dto.DataReqPacket{Key: request.Key, ReadFlag: readFlag}
 	encoder.Encode(req)
-
 	// receive data
 	decoder := gob.NewDecoder(conn)
 	resp := dto.DataRespPacket{}
 	decoder.Decode(&resp)
 	request.Return <- resp.Value
-	fmt.Printf("data received %s\n", resp.Value)
 }
 
-
-// Wait until data is found in cache or request data from db
-func waitForValue(req Request) {
-	var locOwner *DataOwnerInfo // less occupied owner
-	for {
-		select {
-		case owner := <-req.Callback: // data owner found
+// Proccess one packet command response packet from server
+func checkOneOwner(tasks *list.List, owner *DataOwnerInfo) {
+	for e := tasks.Front(); e != nil; e = e.Next() {
+		req := e.Value.(*Request)
+		if req.Id == owner.Id {
+			req.NodeCount--
 			if owner.HasValue {
-				_queueRemove <- req.Id
-				go downloadData(req, owner, false)
-				return
+				tasks.Remove(e)
+				req.LocOwner = owner
+				go downloadData(*req, false)
 			} else {
-				// find less occupied owner
-				if locOwner == nil {
-					locOwner = &owner
+				if req.LocOwner == nil {
+					req.LocOwner = owner
 				} else {
-					if locOwner.ItemsInCache > owner.ItemsInCache {
-						locOwner = &owner
+					if req.LocOwner.ItemsInCache > owner.ItemsInCache {
+						req.LocOwner = owner
 					}
 				}
+				if req.NodeCount == 0 {
+					if req.LocOwner != nil {
+						go downloadData(*req, true)
+					}
+					tasks.Remove(e)
+					return
+				}
 			}
-		case <-time.After(time.Millisecond * 30): // timeout
-			fmt.Println("timeout!")
+		}
+	}
+}
 
-			_queueRemove <- req.Id
-			if locOwner != nil {
-				// no one has value, so ask less occupied one to get it from db
-				go downloadData(req, *locOwner, true)
+// Check if some task have expired (possibly due to offline server)
+func checkForTaskExpiration(tasks *list.List) {
+	for e := tasks.Front(); e != nil; e = e.Next() {
+		req := e.Value.(*Request)
+		if time.Since(req.Start) > time.Duration(_conf.CheckLimit)*time.Millisecond {
+			if req.LocOwner != nil {
+				go downloadData(*req, true)
 			}
-			return
+			tasks.Remove(e)
 		}
 	}
 }
 
 // Any request for cache is stored in queque, until it's is fullfield
+// Incoming packets are muxed to tasks
 // return params
 // queueAdd chan Request - add new Request to Queue
-// queueRun chan DataOwnerInfo - Signals that data owner is found
-// queueRemove - removes item from queue (error or timeout)
-func createRequestQueue() (chan Request, chan DataOwnerInfo, chan int) {
-	queueAdd := make(chan Request, len(ports))
+// queueRun chan DataOwnerInfo - Input for server packets
+func createRequestQueue() (chan Request, chan DataOwnerInfo) {
+	queueAdd := make(chan Request, len(_conf.Nodes))
 	queueRun := make(chan DataOwnerInfo)
-	queueRemove := make(chan int)
 
 	go func() {
 		tasks := list.New()
 		for {
 			select {
 			case req := <-queueAdd: // Add
-				//fmt.Printf("Addind %v to queue\n",req)
-				tasks.PushBack(req)
+				tasks.PushBack(&req)
 
 			case owner := <-queueRun: //Start download process, remove request from queue
-				//fmt.Printf("Running %v owner\n", owner)
-				for e := tasks.Front(); e != nil; e = e.Next() {
-					if e.Value.(Request).Id == owner.Id {
-						e.Value.(Request).Callback <- owner
-					}
-				}
-			case id := <-queueRemove: //Remove item from queue
-				for e := tasks.Front(); e != nil; e = e.Next() {
-					if e.Value.(Request).Id == id {
-						tasks.Remove(e)
-					}
-				}
+				checkOneOwner(tasks, &owner)
+			case <-time.After(time.Duration(_conf.CheckLimit/2) * time.Millisecond):
+				checkForTaskExpiration(tasks)
 			}
 		}
 	}()
-	return queueAdd, queueRun, queueRemove
+	return queueAdd, queueRun
 }
 
-
-var ports = []string{
-	"127.0.0.1:8000",
-	"127.0.0.1:8001",
-	"127.0.0.1:8002",
-	"127.0.0.1:8003",
-}
-
-var _currId int
-var _queueAdd chan Request
-var _queueRemove chan int
-var _queueRun chan DataOwnerInfo
-var _hostPort string
-
-func Get(key string, result *interface{}, executionLimit, expire time.Duration, getter func())(error){
+func Get(key string, result *interface{}, executionLimit, expire time.Duration, getter func()) error {
 	_currId++
-	callback := make(chan DataOwnerInfo)
 	resultCh := make(chan interface{}, 1)
 	timeLimit := time.Now().Add(-expire)
 	req := Request{
-		Id: _currId,
-		Key: key,
-		Callback: callback,
+		Id:        _currId,
+		Key:       key,
 		TimeLimit: timeLimit,
-		Return: resultCh,
+		Return:    resultCh,
+		NodeCount: len(_conf.Nodes),
+		Start:     time.Now(),
 	}
-	go waitForValue(req)
 	_queueAdd <- req
-	// broadcast all instances
-	packet := dto.DiscoverRequest{Key: key, Addr: _hostPort, Id: _currId, TimeLimit: timeLimit}
-	for _, port := range ports {
+	// broadcast all nodes same packet
+	packet := dto.DiscoverRequest{Key: key, Addr: _conf.HostAddr, Id: _currId, TimeLimit: timeLimit}
+	for _, port := range _conf.Nodes {
 		go func(port string) {
 			conn, err := net.Dial("udp", port)
 			if err != nil {
@@ -186,8 +169,8 @@ func Get(key string, result *interface{}, executionLimit, expire time.Duration, 
 		}(port)
 	}
 
-	select{
-	case *result = <- resultCh:
+	select {
+	case *result = <-resultCh:
 		getter()
 		return nil
 	case <-time.After(executionLimit): // timeout
@@ -195,8 +178,26 @@ func Get(key string, result *interface{}, executionLimit, expire time.Duration, 
 	}
 }
 
-func init(){
-	_hostPort = "localhost:8666"
-	_queueAdd, _queueRun, _queueRemove = createRequestQueue();
-	go runCommandServer(_hostPort, _queueRun)
+type Configuration struct {
+	Nodes      []string
+	CheckLimit int
+	HostAddr   string
+}
+
+var _currId int // TODO: it's NOT thread safe
+var _queueAdd chan Request
+var _queueRun chan DataOwnerInfo
+var _conf Configuration
+
+func init() {
+	file, _ := os.Open("om_conf.json")
+	defer file.Close()
+	decoder := json.NewDecoder(file)
+	err := decoder.Decode(&_conf)
+	if err != nil {
+		panic(err)
+	}
+
+	_queueAdd, _queueRun = createRequestQueue()
+	go runCommandServer(_queueRun)
 }
